@@ -1,1 +1,49 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq_broker
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq/
+    networks:
+      - taxi_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping", "-q"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile.producer
+    container_name: taxi_producer
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      INPUT_CSV_PATH: /archive/taxi_trip_data.csv
+      CHUNK_SIZE: 1000
+      EXCHANGE_NAME: taxi_exchange
+      ROUTING_KEY_PROCESSOR: raw.data.processor
+      ROUTING_KEY_UPLOADER: raw.data.uploader
+    volumes:
+      - ./archive:/archive:ro
+    networks:
+      - taxi_network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+
+networks:
+  taxi_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
 
