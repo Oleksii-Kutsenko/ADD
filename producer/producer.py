@@ -1,2 +1,6 @@
+def process_csv_and_publish() -> None:
+    pass
+
+
 if __name__ == "__main__":
-    print("Success")
+    process_csv_and_publish()
