@@ -24,12 +24,13 @@ services:
     environment:
       RABBITMQ_HOST: rabbitmq
       INPUT_CSV_PATH: /archive/taxi_trip_data.csv
-      CHUNK_SIZE: 1000
+      CHUNK_SIZE: 100000
       EXCHANGE_NAME: taxi_exchange
       ROUTING_KEY_PROCESSOR: raw.data.processor
       ROUTING_KEY_UPLOADER: raw.data.uploader
     volumes:
       - ./archive:/archive:ro
+      - ./producer:/app
     networks:
       - taxi_network
     depends_on:
