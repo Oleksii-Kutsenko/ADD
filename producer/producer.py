@@ -14,11 +14,13 @@ SPLIT_WEIGHTS = {"train": 0.7, "test": 0.2, "validation": 0.1}
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "taxi_exchange")
+RAW_DATA_EXCHANGE_TYPE = "fanout"
 ROUTING_KEY_PROCESSOR = os.getenv("ROUTING_KEY_PROCESSOR", "raw.data.processor")
 ROUTING_KEY_UPLOADER = os.getenv("ROUTING_KEY_UPLOADER", "raw.data.uploader")
 INPUT_CSV_PATH = os.getenv("INPUT_CSV_PATH", "/data/taxi_trip_data.csv")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
-DATE_COlUMNS = ["pickup_datetime", "dropoff_datetime"]
+DATE_COLUMNS = ["pickup_datetime", "dropoff_datetime"]
+MESSAGES_BATCH_SIZE = 1000
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -34,7 +36,9 @@ def connect_rabbitmq(host, port, exchange_name, retry_attempts=3, delay_seconds=
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
             channel.exchange_declare(
-                exchange=exchange_name, exchange_type="direct", durable=True
+                exchange=exchange_name,
+                durable=True,
+                exchange_type=RAW_DATA_EXCHANGE_TYPE,
             )
             logger.info(
                 f"Successfully connected to RabbitMQ on {host}:{port} and declared exchange '{exchange_name}'"
@@ -79,7 +83,7 @@ def process_csv_and_publish() -> None:
             INPUT_CSV_PATH,
             chunksize=CHUNK_SIZE,
             iterator=True,
-            parse_dates=DATE_COlUMNS,
+            parse_dates=DATE_COLUMNS,
             date_format="%Y-%m-%d %H:%M:%S",
         )
         for chunk_number, chunk_df in enumerate(csv_iterator):
@@ -88,8 +92,9 @@ def process_csv_and_publish() -> None:
             list_of_row_dicts = chunk_prepared.to_dict(orient="records")
 
             rows_in_chunk_published = 0
+            current_batch_of_rows = []
             for row_dict in list_of_row_dicts:
-                for col_name in DATE_COlUMNS:
+                for col_name in DATE_COLUMNS:
                     assert isinstance(row_dict[col_name], pd.Timestamp), "data problem"
                     row_dict[col_name] = row_dict[col_name].isoformat()
 
@@ -97,27 +102,38 @@ def process_csv_and_publish() -> None:
                     list(SPLIT_WEIGHTS.keys()), weights=SPLIT_WEIGHTS.values(), k=1
                 )[0]
 
-                try:
-                    message_json = json.dumps(row_dict)
-                except TypeError as e:
-                    logger.error(
-                        f"Serialization error in chunk {chunk_number + 1}. Data dict: {row_dict}. Error: {e}"
-                    )
-                    continue
+                current_batch_of_rows.append(row_dict)
 
-                # TODO: use fanout it should halves the time to 15 mins, and batch messages before sending them
-                publish_message(
-                    channel, EXCHANGE_NAME, ROUTING_KEY_PROCESSOR, message_json
-                )
-                publish_message(
-                    channel, EXCHANGE_NAME, ROUTING_KEY_UPLOADER, message_json
-                )
+                if len(current_batch_of_rows) >= MESSAGES_BATCH_SIZE:
+                    try:
+                        batch_message_json = json.dumps(current_batch_of_rows)
+                        publish_message(channel, EXCHANGE_NAME, "", batch_message_json)
+                        total_rows_published += len(current_batch_of_rows)
+                    except TypeError as e:
+                        logger.error(
+                            f"Serialization error in chunk {chunk_number + 1}. Error: {e}"
+                        )
+                        continue
+                    current_batch_of_rows = []
+
                 rows_in_chunk_published += 1
 
             total_rows_published += rows_in_chunk_published
             logger.info(
                 f"Processed chunk {chunk_number + 1}. Published {rows_in_chunk_published} rows. Total published: {total_rows_published}"
             )
+
+            if current_batch_of_rows:
+                try:
+                    batch_message_json = json.dumps(current_batch_of_rows)
+                    publish_message(channel, EXCHANGE_NAME, "", batch_message_json)
+                    total_rows_published += len(current_batch_of_rows)
+                except TypeError as e:
+                    logger.error(
+                        f"Serialization error in chunk {chunk_number + 1}. Error: {e}"
+                    )
+                    continue
+
         elapsed_time = time.time() - start_time
         logger.info(f"Finish processing. Successfully published {total_rows_published}")
         logger.info(f"Total execution time: {elapsed_time:.2f} seconds.")
