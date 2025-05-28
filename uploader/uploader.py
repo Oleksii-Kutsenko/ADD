@@ -100,27 +100,32 @@ def create_raw_trips_table(conn):
         raise 
 
 def insert_raw_trips_batch(conn, batch_of_rows_dicts):
+    logger.info(f"Dicts: {batch_of_rows_dicts[:3]}")
     if not batch_of_rows_dicts:
         return 0
 
-    data_to_insert = []
-    for row_dict in batch_of_rows_dicts:
-        data_to_insert.append(tuple(row_dict.get(col) for col in RAW_TABLE_COLUMNS))
+    cols_str = ", ".join(RAW_TABLE_COLUMNS)
+    placeholders_str = ", ".join(["%s"] * len(RAW_TABLE_COLUMNS))
+    insert_query = f"INSERT INTO {RAW_TABLE_NAME} ({cols_str}) VALUES ({placeholders_str})"
 
-        cols_str = ", ".join(RAW_TABLE_COLUMNS)
-        placeholders_str = ", ".join(["%s"] * len(RAW_TABLE_COLUMNS))
-        insert_query = f"INSERT INTO {RAW_TABLE_NAME} ({cols_str}) VALUES ({placeholders_str})"
+    # logger.info(f"Inspect query {insert_query}")
 
-        try:
-            with conn.cursor() as cur:
-                cur.executemany(insert_query, data_to_insert)
-            conn.commit()
-            logger.info(f"Inserted {len(data_to_insert)} rows")
-            return len(data_to_insert)
-        except psycopg2.Error as e:
-            logger.error(f"Database error: {e}")
-            conn.rollback()
-            return -1
+    data_to_insert = [
+        tuple(row_dict.get(col) for col in RAW_TABLE_COLUMNS)
+        for row_dict in batch_of_rows_dicts
+    ]
+
+    try:
+        with conn.cursor() as cur:
+            logger.info(f"Inserting {len(data_to_insert)} rows")
+            cur.executemany(insert_query, data_to_insert)
+        conn.commit()
+        logger.info(f"Inserted {len(data_to_insert)} rows")
+        return len(data_to_insert)
+    except psycopg2.Error as e:
+        logger.error(f"Database error: {e}")
+        conn.rollback()
+        return -1
 
 def on_message_callback(ch, method, properties, body, db_connection):
     delivery_tag = method.delivery_tag
@@ -129,12 +134,13 @@ def on_message_callback(ch, method, properties, body, db_connection):
     try:
         list_or_rows = json.loads(body.decode("utf-8"))
         logger.info(f"Parsed JSON array with {len(list_or_rows)} rows.")
+        logger.info(f"Message content: {list_or_rows[:3]}")
 
-        # TODO: something wrong with this insert_raw_trips_batch
         inserted_count = insert_raw_trips_batch(db_connection, list_or_rows)
 
         if inserted_count >= 0:
             logger.info(f"Deliver tag: {delivery_tag}")
+            ch.basic_ack(delivery_tag=delivery_tag)
         else:
             logger.error(f"Failed to insert rows into DB. Delivery tag: {delivery_tag}")
             cn.basic_nack(delivery_tag=delivery_tag, requeue=False)
