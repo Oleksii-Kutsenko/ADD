@@ -6,7 +6,7 @@ import time
 
 import pika
 import psycopg2
-from psycopg2 import extras
+from psycopg2.extras import execute_values
 
 logging.basicConfig(
     level="INFO",
@@ -25,7 +25,7 @@ DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_NAME = os.getenv("POSTGRES_DB", "taxi_data")
 DB_USER = os.getenv("POSTGRES_USER", "taxi_user")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "strong_password")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "taxi_password")
 RAW_TABLE_NAME = "raw_taxi_trips"
 RAW_TABLE_COLUMNS = [
     "vendor_id",
@@ -65,6 +65,7 @@ def get_db_connection():
         logger.error(f"Failed to connect: {e}")
         return None
 
+
 def create_raw_trips_table(conn):
     create_table_query = f"""
     CREATE TABLE IF NOT EXISTS {RAW_TABLE_NAME} (
@@ -97,35 +98,34 @@ def create_raw_trips_table(conn):
     except psycopg2.Error as e:
         logger.error(f"Error during creation of table: {e}")
         conn.rollback()
-        raise 
+        raise
 
-def insert_raw_trips_batch(conn, batch_of_rows_dicts):
-    logger.info(f"Dicts: {batch_of_rows_dicts[:3]}")
-    if not batch_of_rows_dicts:
+
+def insert_raw_trips_batch(conn, batch):
+    logger.info(f"Dicts: {batch[:3]}")
+    if not batch:
         return 0
 
-    cols_str = ", ".join(RAW_TABLE_COLUMNS)
-    placeholders_str = ", ".join(["%s"] * len(RAW_TABLE_COLUMNS))
-    insert_query = f"INSERT INTO {RAW_TABLE_NAME} ({cols_str}) VALUES ({placeholders_str})"
+    sql = f"""INSERT INTO {RAW_TABLE_NAME} ({", ".join(RAW_TABLE_COLUMNS)})
+              VALUES %s"""
 
     # logger.info(f"Inspect query {insert_query}")
 
-    data_to_insert = [
-        tuple(row_dict.get(col) for col in RAW_TABLE_COLUMNS)
-        for row_dict in batch_of_rows_dicts
-    ]
+    values_iter = [tuple(row[col] for col in RAW_TABLE_COLUMNS) for row in batch]
+    len_values_iter = len(values_iter)
 
     try:
         with conn.cursor() as cur:
-            logger.info(f"Inserting {len(data_to_insert)} rows")
-            cur.executemany(insert_query, data_to_insert)
+            logger.info(f"Inserting {len_values_iter} rows")
+            execute_values(cur, sql, values_iter, page_size=10000)
         conn.commit()
-        logger.info(f"Inserted {len(data_to_insert)} rows")
-        return len(data_to_insert)
+        logger.info(f"Inserted {len_values_iter} rows")
+        return len_values_iter
     except psycopg2.Error as e:
         logger.error(f"Database error: {e}")
         conn.rollback()
         return -1
+
 
 def on_message_callback(ch, method, properties, body, db_connection):
     delivery_tag = method.delivery_tag
@@ -143,12 +143,13 @@ def on_message_callback(ch, method, properties, body, db_connection):
             ch.basic_ack(delivery_tag=delivery_tag)
         else:
             logger.error(f"Failed to insert rows into DB. Delivery tag: {delivery_tag}")
-            cn.basic_nack(delivery_tag=delivery_tag, requeue=False)
+            ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
     except json.JSONDecodeError as e:
         logger.error(f"JSONDecodeError: {e}. Message body: {body[:200]}")
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
+
 
 def main():
     logger.info("Listening messages")
@@ -166,13 +167,18 @@ def main():
         db_conn.close()
         sys.exit(1)
 
-    connection_params = pika.ConnectionParameters(host=RABBITMQ_HOST, port=RABBITMQ_PORT, heartbeat=600)
+    connection_params = pika.ConnectionParameters(
+        host=RABBITMQ_HOST, port=RABBITMQ_PORT, heartbeat=600
+    )
     try:
         connection = pika.BlockingConnection(connection_params)
         channel = connection.channel()
 
-        channel.exchange_declare(exchange=FANOUT_EXCHANGE_NAME, exchange_type="fanout", durable=True)
+        channel.exchange_declare(
+            exchange=FANOUT_EXCHANGE_NAME, exchange_type="fanout", durable=True
+        )
 
+        channel.queue_declare(queue=RAW_DATA_QUEUE_NAME, durable=True)
         channel.queue_bind(exchange=FANOUT_EXCHANGE_NAME, queue=RAW_DATA_QUEUE_NAME)
 
         channel.basic_qos(prefetch_count=1)
@@ -180,7 +186,9 @@ def main():
             ch, method, properties, body, db_conn
         )
 
-        channel.basic_consume(queue=RAW_DATA_QUEUE_NAME, on_message_callback=callback_with_db)
+        channel.basic_consume(
+            queue=RAW_DATA_QUEUE_NAME, on_message_callback=callback_with_db
+        )
         channel.start_consuming()
     except pika.exceptions.AMQPConnectionError as e:
         logger.error(f"RabbitMQ error: {e}")
@@ -188,13 +196,13 @@ def main():
         logger.error(f"Unexpected error {e}")
     finally:
         logger.info("Shutting down")
-        if 'db_conn' in locals() and db_conn and not db_conn.closed:
+        if db_conn and not db_conn.closed:
             db_conn.close()
             logger.info("Postgres connection closed")
-        if 'connection' in locals() and connection and connection.is_open:
+        if connection and connection.is_open:
             connection.close()
             logger.info("RabbitMQ connection closed")
 
+
 if __name__ == "__main__":
     main()
-
