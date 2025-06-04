@@ -71,6 +71,9 @@ services:
       POSTGRES_DB: taxi_data
       POSTGRES_USER: taxi_user
       POSTGRES_PASSWORD: taxi_password
+      PROCESSED_EXCHANGE: processed_exchange
+      PROCESSED_QUEUE: uploader_processed_data_queue
+      PROCESSED_TABLE: processed_taxi_trips
     volumes:
       - ./uploader:/app
     networks:
@@ -100,7 +103,6 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
-    restart: on-failure
 
 
 networks:

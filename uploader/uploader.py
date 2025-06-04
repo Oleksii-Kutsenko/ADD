@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import sys
-import time
 
 import pika
 import psycopg2
@@ -10,24 +9,20 @@ from psycopg2.extras import execute_values
 
 logging.basicConfig(
     level="INFO",
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s  %(levelname)-8s %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uploader")
+
 
 # Rabbit
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
+# Raw
 FANOUT_EXCHANGE_NAME = os.getenv("PRODUCER_FANOUT_EXCHANGE_NAME", "taxi_exchange")
-RAW_DATA_QUEUE_NAME = os.getenv("UPLOADER_RAW_QUEUE_NAME", "uploader_raw_data_queue")
-# Postgres
-DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
-DB_PORT = os.getenv("POSTGRES_PORT", "5432")
-DB_NAME = os.getenv("POSTGRES_DB", "taxi_data")
-DB_USER = os.getenv("POSTGRES_USER", "taxi_user")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "taxi_password")
+RAW_QUEUE_NAME = os.getenv("UPLOADER_RAW_QUEUE_NAME", "uploader_raw_data_queue")
 RAW_TABLE_NAME = "raw_taxi_trips"
-RAW_TABLE_COLUMNS = [
+RAW_COLUMNS = [
     "vendor_id",
     "pickup_datetime",
     "dropoff_datetime",
@@ -47,27 +42,47 @@ RAW_TABLE_COLUMNS = [
     "dropoff_location_id",
     "split_group",
 ]
+# Postgres
+PROCESSED_EXCHANGE = os.getenv("PROCESSED_EXCHANGE", "processed_exchange")
+PROCESSED_QUEUE = os.getenv("PROCESSED_QUEUE", "uploader_processed_data_queue")
+PROCESSED_TABLE_NAME = os.getenv("PROCESSED_TABLE", "processed_taxi_trips")
+PROCESSED_COLUMNS = RAW_COLUMNS + [
+    "trip_duration_s",
+    "avg_speed_mph",
+    "pickup_hour",
+    "pickup_dow",
+    "pickup_month",
+    "borough_pickup",
+]
+
+# Postgres
+DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
+DB_PORT = os.getenv("POSTGRES_PORT", "5432")
+DB_NAME = os.getenv("POSTGRES_DB", "taxi_data")
+DB_USER = os.getenv("POSTGRES_USER", "taxi_user")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "taxi_password")
+
+PAGE_SIZE = 1000
 
 
 def get_db_connection():
-    conn_params = {
-        "host": DB_HOST,
-        "port": DB_PORT,
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-    }
     try:
-        conn = psycopg2.connect(**conn_params)
-        logger.info(f"Connected to {DB_NAME}")
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+        )
+        logger.info("Connected to Postgres")
         return conn
     except psycopg2.OperationalError as e:
-        logger.error(f"Failed to connect: {e}")
+        logger.error("Postgres connection failed: %s", e)
         return None
 
 
-def create_raw_trips_table(conn):
-    create_table_query = f"""
+def create_trips_tables(conn):
+    raw_table = f"""
     CREATE TABLE IF NOT EXISTS {RAW_TABLE_NAME} (
         id SERIAL PRIMARY KEY,
         vendor_id INTEGER,
@@ -90,9 +105,38 @@ def create_raw_trips_table(conn):
         split_group TEXT
     )
     """
+    processed_table = f"""
+    CREATE TABLE IF NOT EXISTS {PROCESSED_TABLE_NAME} (
+        id SERIAL PRIMARY KEY,
+        vendor_id SMALLINT,
+        pickup_datetime TIMESTAMP,
+        dropoff_datetime TIMESTAMP,
+        passenger_count SMALLINT,
+        trip_distance NUMERIC,
+        rate_code TEXT,
+        store_and_fwd_flag TEXT,
+        payment_type TEXT,
+        fare_amount NUMERIC,
+        extra NUMERIC,
+        mta_tax NUMERIC,
+        tip_amount NUMERIC,
+        tolls_amount NUMERIC,
+        imp_surcharge NUMERIC,
+        total_amount NUMERIC,
+        pickup_location_id SMALLINT,
+        dropoff_location_id SMALLINT,
+        split_group CHAR(1),
+        trip_duration_s INTEGER,
+        avg_speed_mph NUMERIC,
+        pickup_hour SMALLINT,
+        pickup_dow  SMALLINT,
+        pickup_month SMALLINT,
+        borough_pickup TEXT
+    );"""
     try:
         with conn.cursor() as cur:
-            cur.execute(create_table_query)
+            cur.execute(raw_table)
+            cur.execute(processed_table)
         conn.commit()
         logger.info(f"Data table has been created")
     except psycopg2.Error as e:
@@ -101,107 +145,80 @@ def create_raw_trips_table(conn):
         raise
 
 
-def insert_raw_trips_batch(conn, batch):
-    logger.info(f"Dicts: {batch[:3]}")
-    if not batch:
+def bulk_insert(conn, table, cols, rows):
+    if not rows:
         return 0
+    sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
+    data_iter = [tuple(r.get(c) for c in cols) for r in rows]
+    with conn.cursor() as cur:
+        execute_values(cur, sql, data_iter, page_size=PAGE_SIZE)
+    conn.commit()
+    return len(rows)
+    return -1
 
-    sql = f"""INSERT INTO {RAW_TABLE_NAME} ({", ".join(RAW_TABLE_COLUMNS)})
-              VALUES %s"""
 
-    # logger.info(f"Inspect query {insert_query}")
-
-    values_iter = [tuple(row[col] for col in RAW_TABLE_COLUMNS) for row in batch]
-    len_values_iter = len(values_iter)
-
+def handle_raw(ch, method, _props, body, db_conn):
     try:
-        with conn.cursor() as cur:
-            logger.info(f"Inserting {len_values_iter} rows")
-            execute_values(cur, sql, values_iter, page_size=10000)
-        conn.commit()
-        logger.info(f"Inserted {len_values_iter} rows")
-        return len_values_iter
-    except psycopg2.Error as e:
-        logger.error(f"Database error: {e}")
-        conn.rollback()
-        return -1
+        rows = json.loads(body)
+        n = bulk_insert(db_conn, RAW_TABLE_NAME, RAW_COLUMNS, rows)
+        logger.info("RAW inserted %d rows", n)
+        ch.basic_ack(method.delivery_tag)
+    except Exception:
+        logger.exception("RAW insert failed – nacking")
+        ch.basic_nack(method.delivery_tag, requeue=False)
 
 
-def on_message_callback(ch, method, properties, body, db_connection):
-    delivery_tag = method.delivery_tag
-    logger.info(f"Message delivery_tag: {delivery_tag}, size: {len(body)}")
-
+def handle_processed(ch, method, _props, body, db_conn):
     try:
-        list_or_rows = json.loads(body.decode("utf-8"))
-        logger.info(f"Parsed JSON array with {len(list_or_rows)} rows.")
-        logger.info(f"Message content: {list_or_rows[:3]}")
-
-        inserted_count = insert_raw_trips_batch(db_connection, list_or_rows)
-
-        if inserted_count >= 0:
-            logger.info(f"Deliver tag: {delivery_tag}")
-            ch.basic_ack(delivery_tag=delivery_tag)
-        else:
-            logger.error(f"Failed to insert rows into DB. Delivery tag: {delivery_tag}")
-            ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSONDecodeError: {e}. Message body: {body[:200]}")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        ch.basic_nack(delivery_tag=delivery_tag, requeue=False)
+        rows = json.loads(body)
+        n = bulk_insert(db_conn, PROCESSED_TABLE_NAME, PROCESSED_COLUMNS, rows)
+        logger.info("PROCESSED inserted %d rows", n)
+        ch.basic_ack(method.delivery_tag)
+    except Exception:
+        logger.exception("PROCESSED insert failed – nacking")
+        ch.basic_nack(method.delivery_tag, requeue=False)
 
 
 def main():
-    logger.info("Listening messages")
-
     db_conn = get_db_connection()
     if not db_conn:
-        logger.error(f"Exiting. Error", exc_info=True)
-        db_conn.close()
         sys.exit(1)
+    create_trips_tables(db_conn)
 
-    try:
-        create_raw_trips_table(db_conn)
-    except Exception as e:
-        logger.error(f"Error during creation of table. Error: {e}")
-        db_conn.close()
-        sys.exit(1)
-
-    connection_params = pika.ConnectionParameters(
+    params = pika.ConnectionParameters(
         host=RABBITMQ_HOST, port=RABBITMQ_PORT, heartbeat=600
     )
+    connection = pika.BlockingConnection(params)
+    channel = connection.channel()
+
+    channel.exchange_declare(FANOUT_EXCHANGE_NAME, exchange_type="fanout", durable=True)
+    channel.exchange_declare(PROCESSED_EXCHANGE, exchange_type="fanout", durable=True)
+
+    channel.queue_declare(RAW_QUEUE_NAME, durable=True)
+    channel.queue_declare(PROCESSED_QUEUE, durable=True)
+
+    channel.queue_bind(RAW_QUEUE_NAME, FANOUT_EXCHANGE_NAME)
+    channel.queue_bind(PROCESSED_QUEUE, PROCESSED_EXCHANGE)
+
+    channel.basic_qos(prefetch_count=2)
+
+    channel.basic_consume(
+        queue=RAW_QUEUE_NAME,
+        on_message_callback=lambda ch, m, p, b: handle_raw(ch, m, p, b, db_conn),
+    )
+    channel.basic_consume(
+        queue=PROCESSED_QUEUE,
+        on_message_callback=lambda ch, m, p, b: handle_processed(ch, m, p, b, db_conn),
+    )
+
+    logger.info("Uploader ready...")
     try:
-        connection = pika.BlockingConnection(connection_params)
-        channel = connection.channel()
-
-        channel.exchange_declare(
-            exchange=FANOUT_EXCHANGE_NAME, exchange_type="fanout", durable=True
-        )
-
-        channel.queue_declare(queue=RAW_DATA_QUEUE_NAME, durable=True)
-        channel.queue_bind(exchange=FANOUT_EXCHANGE_NAME, queue=RAW_DATA_QUEUE_NAME)
-
-        channel.basic_qos(prefetch_count=1)
-        callback_with_db = lambda ch, method, properties, body: on_message_callback(
-            ch, method, properties, body, db_conn
-        )
-
-        channel.basic_consume(
-            queue=RAW_DATA_QUEUE_NAME, on_message_callback=callback_with_db
-        )
         channel.start_consuming()
-    except pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"RabbitMQ error: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error {e}")
     finally:
-        logger.info("Shutting down")
         if db_conn and not db_conn.closed:
             db_conn.close()
-            logger.info("Postgres connection closed")
         if connection and connection.is_open:
             connection.close()
-            logger.info("RabbitMQ connection closed")
 
 
 if __name__ == "__main__":

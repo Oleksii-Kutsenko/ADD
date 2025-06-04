@@ -9,16 +9,12 @@ ESSENTIALS = ["pickup_datetime", "dropoff_datetime", "trip_distance", "total_amo
 
 
 def load_borough_lookup(path: str) -> dict:
-    try:
-        df = pd.read_csv(path, usecols=["zone_id", "borought"])
-        df["zone_id"] = pd.to_numeric(df["zone_id"], errors="coerce").astype("Int64")
-        return df.set_index("zone_id")["borought"].to_dict()
-    except Exception:
-        logger.exception("Failed to load lookup file")
-        return None
+    df = pd.read_csv(path, usecols=["zone_id", "borough"])
+    df["zone_id"] = pd.to_numeric(df["zone_id"], errors="coerce").astype("Int64")
+    return df.set_index("zone_id")["borough"].to_dict()
 
 
-def clean_and_enrich_batch(df: pd.Dataframe, borough_map: dict) -> None:
+def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> None:
     datetime_cols = ["pickup_datetime", "dropoff_datetime"]
     numeric_cols = [
         "trip_distance",
@@ -33,6 +29,7 @@ def clean_and_enrich_batch(df: pd.Dataframe, borough_map: dict) -> None:
     df[datetime_cols] = df[datetime_cols].apply(
         pd.to_datetime, errors="coerce", utc=False
     )
+
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
     df = df.dropna(subset=ESSENTIALS)
@@ -56,4 +53,11 @@ def clean_and_enrich_batch(df: pd.Dataframe, borough_map: dict) -> None:
 
     df["borough_pickup"] = df.pickup_location_id.map(borough_map).astype("string")
 
+    datetime_cols = df.select_dtypes(
+        include=["datetime64[ns]", "datetime64[ns, UTC]"]
+    ).columns
+    for col in datetime_cols:
+        df[col] = df[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    df = df.where(pd.notnull(df), None)
     return df.reset_index(drop=True)

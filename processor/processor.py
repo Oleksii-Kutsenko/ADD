@@ -22,7 +22,9 @@ RAW_EXCHANGE = os.getenv("RAW_EXCHANGE", "taxi_exchange")
 PROC_EXCHANGE = os.getenv("PROC_EXCHANGE", "processed_exchange")
 ROUTING_KEY = os.getenv("ROUTING_KEY_UPLOADER", "processed.data.uploader")
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", 10_000))
-GEO_LOOKUP = os.getenv("GEO_LOOKUP_PATH", "./arhiche/taxi_zone_geo.csv")
+GEO_LOOKUP = os.getenv("GEO_LOOKUP_PATH", "/archive/taxi_zone_geo.csv")
+
+borough_map = load_borough_lookup(GEO_LOOKUP)
 
 
 def publish_batch(channel, records):
@@ -44,9 +46,9 @@ def on_message(ch, method, _props, body: bytes):
         cleaned = clean_and_enrich_batch(df, borough_map)
         publish_batch(ch, cleaned.to_dict("records"))
         ch.basic_ack(delivery_tag)
-        log.info("Processed %s → published %s rows", len(df), len(cleaned))
+        logger.info("Processed %s → published %s rows", len(df), len(cleaned))
     except Exception:
-        log.exception("processing failed – nacking")
+        logger.exception("processing failed – nacking")
         ch.basic_nack(delivery_tag, requeue=False)
 
 
