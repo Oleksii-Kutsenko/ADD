@@ -1,8 +1,8 @@
-import json
 import logging
 import os
 import sys
 
+import orjson
 import pika
 import psycopg2
 from psycopg2.extras import execute_values
@@ -63,6 +63,7 @@ DB_USER = os.getenv("POSTGRES_USER", "taxi_user")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "taxi_password")
 
 PAGE_SIZE = 5000
+ROW_LIMIT = 5000
 
 
 def get_db_connection():
@@ -146,24 +147,33 @@ def create_trips_tables(conn):
 
 
 def bulk_insert(conn, table, cols, rows):
+    """Fast, safe bulk insert with automatic sub-chunking."""
     if not rows:
         return 0
+
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
-    data_iter = [tuple(r.get(c) for c in cols) for r in rows]
-    with conn.cursor() as cur:
-        try:
-            execute_values(cur, sql, data_iter, page_size=PAGE_SIZE)
-        except Exception as error:
-            logger.error("Insertion error: %s", error)
-            raise
-    conn.commit()
-    return len(rows)
-    return -1
+
+    start = 0
+    total = 0
+    while start < len(rows):
+        sub_rows = rows[start : start + ROW_LIMIT]
+
+        def row_iter():
+            for r in sub_rows:
+                yield tuple(r.get(c) for c in cols)
+
+        with conn.cursor() as cur:
+            execute_values(cur, sql, row_iter(), page_size=ROW_LIMIT)
+        conn.commit()
+
+        total += len(sub_rows)
+        start += ROW_LIMIT
+    return total
 
 
 def handle_raw(ch, method, _props, body, db_conn):
     try:
-        rows = json.loads(body)
+        rows = orjson.loads(body)
         n = bulk_insert(db_conn, RAW_TABLE_NAME, RAW_COLUMNS, rows)
         logger.info("RAW inserted %d rows", n)
         ch.basic_ack(method.delivery_tag)
@@ -174,7 +184,7 @@ def handle_raw(ch, method, _props, body, db_conn):
 
 def handle_processed(ch, method, _props, body, db_conn):
     try:
-        rows = json.loads(body)
+        rows = orjson.loads(body)
         n = bulk_insert(db_conn, PROCESSED_TABLE_NAME, PROCESSED_COLUMNS, rows)
         logger.info("PROCESSED inserted %d rows", n)
         ch.basic_ack(method.delivery_tag)
@@ -204,7 +214,7 @@ def main():
     channel.queue_bind(RAW_QUEUE_NAME, FANOUT_EXCHANGE_NAME)
     channel.queue_bind(PROCESSED_QUEUE, PROCESSED_EXCHANGE)
 
-    channel.basic_qos(prefetch_count=2)
+    channel.basic_qos(prefetch_count=4)
 
     channel.basic_consume(
         queue=RAW_QUEUE_NAME,

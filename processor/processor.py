@@ -4,6 +4,7 @@ import os
 import sys
 
 import numpy as np
+import orjson
 import pandas as pd
 import pika
 
@@ -36,7 +37,7 @@ def load_borough_lookup(path: str) -> dict:
 borough_map = load_borough_lookup(GEO_LOOKUP)
 
 
-def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> None:
+def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> pd.DataFrame:
     datetime_cols = ["pickup_datetime", "dropoff_datetime"]
     numeric_cols = [
         "trip_distance",
@@ -51,7 +52,6 @@ def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> None:
     df[datetime_cols] = df[datetime_cols].apply(
         pd.to_datetime, errors="coerce", utc=False
     )
-
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
     df = df.dropna(subset=ESSENTIALS)
@@ -75,9 +75,7 @@ def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> None:
 
     df["borough_pickup"] = df.pickup_location_id.map(borough_map).astype("string")
 
-    datetime_cols = df.select_dtypes(
-        include=["datetime64[ns]", "datetime64[ns, UTC]"]
-    ).columns
+    # ISO-8601 datetime strings
     for col in datetime_cols:
         df[col] = df[col].dt.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -85,29 +83,29 @@ def clean_and_enrich_batch(df: pd.DataFrame, borough_map: dict) -> None:
     return df.reset_index(drop=True)
 
 
-def publish_batch(channel, records):
-    for start in range(0, len(records), PAGE_SIZE):
-        slice_ = records[start : start + PAGE_SIZE]
+def publish_batch(channel, records_list):
+    for start in range(0, len(records_list), PAGE_SIZE):
+        payload = orjson.dumps(records_list[start : start + PAGE_SIZE])
         channel.basic_publish(
             exchange=PROC_EXCHANGE,
             routing_key=ROUTING_KEY,
-            body=json.dumps(slice_).encode(),
+            body=payload,
             properties=pika.BasicProperties(delivery_mode=2),
         )
 
 
 def on_message(ch, method, _props, body: bytes):
-    delivery_tag = method.delivery_tag
+    tag = method.delivery_tag
     try:
-        raw_rows = json.loads(body)
-        df = pd.DataFrame(raw_rows)
-        cleaned = clean_and_enrich_batch(df, borough_map)
-        publish_batch(ch, cleaned.to_dict("records"))
-        ch.basic_ack(delivery_tag)
-        logger.info("Processed %s → published %s rows", len(df), len(cleaned))
+        df = pd.DataFrame(orjson.loads(body))
+        cleaned_df = clean_and_enrich_batch(df, borough_map)
+        records = cleaned_df.to_dict("records")
+        publish_batch(ch, records)
+        ch.basic_ack(tag)
+        logger.info("Processed %d → published %d rows", len(df), len(cleaned_df))
     except Exception:
         logger.exception("processing failed – nacking")
-        ch.basic_nack(delivery_tag, requeue=False)
+        ch.basic_nack(tag, requeue=False)
 
 
 def main():
@@ -118,16 +116,12 @@ def main():
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
 
-    channel.exchange_declare(
-        exchange=RAW_EXCHANGE, exchange_type="fanout", durable=True
-    )
-    channel.exchange_declare(
-        exchange=PROC_EXCHANGE, exchange_type="fanout", durable=True
-    )
-    channel.queue_declare(queue=RAW_QUEUE, durable=True)
-    channel.queue_bind(queue=RAW_QUEUE, exchange=RAW_EXCHANGE)
+    channel.exchange_declare(RAW_EXCHANGE, "fanout", durable=True)
+    channel.exchange_declare(PROC_EXCHANGE, "fanout", durable=True)
+    channel.queue_declare(RAW_QUEUE, durable=True)
+    channel.queue_bind(RAW_QUEUE, exchange=RAW_EXCHANGE)
 
-    channel.basic_qos(prefetch_count=1)
+    channel.basic_qos(prefetch_count=4)
     channel.basic_consume(queue=RAW_QUEUE, on_message_callback=on_message)
 
     logger.info("Waiting for raw batches…")

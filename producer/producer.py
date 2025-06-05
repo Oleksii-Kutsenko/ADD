@@ -1,29 +1,34 @@
 import json
 import logging
 import os
-import random
 import sys
 import time
 
+import numpy as np
+import orjson
 import pandas as pd
 import pika
 
-SPLIT_WEIGHTS = {"train": 0.7, "test": 0.2, "validation": 0.1}
+SPLITS = np.array(["train", "test", "validation"])
+WEIGHTS = np.array([0.7, 0.2, 0.1])
 
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "taxi_exchange")
 RAW_DATA_EXCHANGE_TYPE = "fanout"
+INPUT_CSV_PATH = os.getenv("INPUT_CSV_PATH", "/data/taxi_trip_data.csv")
+
 ROUTING_KEY_PROCESSOR = os.getenv("ROUTING_KEY_PROCESSOR", "raw.data.processor")
 ROUTING_KEY_UPLOADER = os.getenv("ROUTING_KEY_UPLOADER", "raw.data.uploader")
-INPUT_CSV_PATH = os.getenv("INPUT_CSV_PATH", "/data/taxi_trip_data.csv")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 5000))
+
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 59_000))
+MESSAGES_BATCH_SIZE = int(os.getenv("MESSAGES_BATCH_SIZE", 59_000))
+
+
 DATE_COLUMNS = ["pickup_datetime", "dropoff_datetime"]
-MESSAGES_BATCH_SIZE = 5000
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-
 logger = logging.getLogger(__name__)
 
 
@@ -87,38 +92,24 @@ def process_csv_and_publish() -> None:
             date_format="%Y-%m-%d %H:%M:%S",
         )
         for chunk_number, chunk_df in enumerate(csv_iterator):
+            chunk_df["split_group"] = np.random.choice(SPLITS, len(chunk_df), p=WEIGHTS)
+            chunk_df[DATE_COLUMNS] = chunk_df[DATE_COLUMNS].apply(
+                lambda s: s.dt.strftime("%Y-%m-%dT%H:%M:%S")
+            )
             chunk_prepared = chunk_df.astype(object).where(pd.notnull(chunk_df), None)
-
-            list_of_row_dicts = chunk_prepared.to_dict(orient="records")
 
             rows_in_chunk_published = 0
             current_batch_of_rows = []
-            for row_dict in list_of_row_dicts:
-                for col_name in DATE_COLUMNS:
-                    assert isinstance(row_dict[col_name], pd.Timestamp), "data problem"
-                    row_dict[col_name] = row_dict[col_name].isoformat()
+            for start in range(0, len(chunk_prepared), MESSAGES_BATCH_SIZE):
+                batch = chunk_prepared.iloc[start : start + MESSAGES_BATCH_SIZE]
+                channel.basic_publish(
+                    exchange=EXCHANGE_NAME,
+                    routing_key="",
+                    body=orjson.dumps(batch.to_dict("records")),
+                    properties=pika.BasicProperties(delivery_mode=2),
+                )
 
-                row_dict["split_group"] = random.choices(
-                    list(SPLIT_WEIGHTS.keys()), weights=SPLIT_WEIGHTS.values(), k=1
-                )[0]
-
-                current_batch_of_rows.append(row_dict)
-
-                if len(current_batch_of_rows) >= MESSAGES_BATCH_SIZE:
-                    try:
-                        batch_message_json = json.dumps(current_batch_of_rows)
-                        publish_message(channel, EXCHANGE_NAME, "", batch_message_json)
-                        total_rows_published += len(current_batch_of_rows)
-                    except TypeError as e:
-                        logger.error(
-                            f"Serialization error in chunk {chunk_number + 1}. Error: {e}"
-                        )
-                        continue
-                    current_batch_of_rows = []
-
-                rows_in_chunk_published += 1
-
-            total_rows_published += rows_in_chunk_published
+            total_rows_published += len(chunk_prepared)
             logger.info(
                 f"Processed chunk {chunk_number + 1}. Published {rows_in_chunk_published} rows. Total published: {total_rows_published}"
             )
@@ -137,6 +128,7 @@ def process_csv_and_publish() -> None:
         elapsed_time = time.time() - start_time
         logger.info(f"Finish processing. Successfully published {total_rows_published}")
         logger.info(f"Total execution time: {elapsed_time:.2f} seconds.")
+        logger.info(f"Processing speed {total_rows_published/elapsed_time:.2f} per second")
     except FileNotFoundError:
         logger.error(f"CSV file not found {INPUT_CSV_PATH}")
     except pika.exceptions.AMQPConnectionError as connection_error:
