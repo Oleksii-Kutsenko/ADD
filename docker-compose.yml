@@ -64,13 +64,16 @@ services:
     container_name: taxi_uploader
     environment:
       RABBITMQ_HOST: rabbitmq
-      PRODUCER_FANOUT_EXCHANGE: taxi_exchange
+      PRODUCER_FANOUT_EXCHANGE_NAME: taxi_exchange
       UPLOADER_RAW_QUEUE_NAME: uploader_raw_data_queue
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: taxi_data
       POSTGRES_USER: taxi_user
       POSTGRES_PASSWORD: taxi_password
+      PROCESSED_EXCHANGE: processed_exchange
+      PROCESSED_QUEUE: uploader_processed_data_queue
+      PROCESSED_TABLE: processed_taxi_trips
     volumes:
       - ./uploader:/app
     networks:
@@ -81,6 +84,25 @@ services:
       postgres:
         condition: service_healthy
     restart: on-failure
+  processor:
+    build:
+      context: ./processor
+      dockerfile: Dockerfile.processor
+    container_name: taxi_processor
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      FANOUT_EXCHANGE: taxi_exchange
+      RAW_QUEUE: processor_raw_data_queue
+      PROC_EXCHANGE: processed_exchange
+      ROUTING_KEY_UPLOADER: processed.data.uploader
+    volumes:
+      - ./archive:/archive:ro
+      - ./processor:/app
+    networks:
+      - taxi_network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
 
 networks:
