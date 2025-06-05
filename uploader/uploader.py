@@ -62,7 +62,7 @@ DB_NAME = os.getenv("POSTGRES_DB", "taxi_data")
 DB_USER = os.getenv("POSTGRES_USER", "taxi_user")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "taxi_password")
 
-PAGE_SIZE = 1000
+PAGE_SIZE = 5000
 
 
 def get_db_connection():
@@ -125,7 +125,7 @@ def create_trips_tables(conn):
         total_amount NUMERIC,
         pickup_location_id SMALLINT,
         dropoff_location_id SMALLINT,
-        split_group CHAR(1),
+        split_group TEXT,
         trip_duration_s INTEGER,
         avg_speed_mph NUMERIC,
         pickup_hour SMALLINT,
@@ -151,7 +151,11 @@ def bulk_insert(conn, table, cols, rows):
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
     data_iter = [tuple(r.get(c) for c in cols) for r in rows]
     with conn.cursor() as cur:
-        execute_values(cur, sql, data_iter, page_size=PAGE_SIZE)
+        try:
+            execute_values(cur, sql, data_iter, page_size=PAGE_SIZE)
+        except Exception as error:
+            logger.error("Insertion error: %s", error)
+            raise
     conn.commit()
     return len(rows)
     return -1

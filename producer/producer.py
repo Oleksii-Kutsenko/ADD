@@ -18,9 +18,9 @@ RAW_DATA_EXCHANGE_TYPE = "fanout"
 ROUTING_KEY_PROCESSOR = os.getenv("ROUTING_KEY_PROCESSOR", "raw.data.processor")
 ROUTING_KEY_UPLOADER = os.getenv("ROUTING_KEY_UPLOADER", "raw.data.uploader")
 INPUT_CSV_PATH = os.getenv("INPUT_CSV_PATH", "/data/taxi_trip_data.csv")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 5000))
 DATE_COLUMNS = ["pickup_datetime", "dropoff_datetime"]
-MESSAGES_BATCH_SIZE = 1000
+MESSAGES_BATCH_SIZE = 5000
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
