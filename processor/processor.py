@@ -128,6 +128,7 @@ def main():
     try:
         channel.start_consuming()
     finally:
+        channel.close()
         connection.close()
 
 

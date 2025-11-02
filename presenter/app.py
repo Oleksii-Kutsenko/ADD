@@ -163,6 +163,18 @@ class DailyFare(Resource):
         return fetch_all(sql, params)
 
 
-# ─────────────────────────────────────────────────────────────────── #
+borough = api.model("Borough", {"borough": fields.String})
+
+
+@api.route("/boroughs")
+class Borough(Resource):
+    @api.marshal_list_with(borough)
+    def get(self):
+        sql = """
+        select distinct borough_pickup as borough from processed_taxi_trips where borough_pickup is not null order by borough_pickup;
+        """
+        return fetch_all(sql, [])
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)

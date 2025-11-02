@@ -128,7 +128,9 @@ def process_csv_and_publish() -> None:
         elapsed_time = time.time() - start_time
         logger.info(f"Finish processing. Successfully published {total_rows_published}")
         logger.info(f"Total execution time: {elapsed_time:.2f} seconds.")
-        logger.info(f"Processing speed {total_rows_published/elapsed_time:.2f} per second")
+        logger.info(
+            f"Processing speed {total_rows_published/elapsed_time:.2f} per second"
+        )
     except FileNotFoundError:
         logger.error(f"CSV file not found {INPUT_CSV_PATH}")
     except pika.exceptions.AMQPConnectionError as connection_error:
@@ -136,9 +138,9 @@ def process_csv_and_publish() -> None:
     except Exception as unexpected_error:
         logger.error(f"Unexpected error: {unexpected_error}", exc_info=True)
     finally:
-        if connection and connection.is_open:
-            connection.close()
-            logger.info("Connection has been successfully closed.")
+        connection.close()
+        channel.close()
+        logger.info("Connection has been successfully closed.")
     logger.info("Success")
 
 

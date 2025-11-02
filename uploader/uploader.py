@@ -151,6 +151,7 @@ def bulk_insert(conn, table, cols, rows):
     if not rows:
         return 0
 
+    # compile
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
 
     start = 0

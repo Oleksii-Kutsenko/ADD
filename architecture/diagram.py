@@ -2,6 +2,7 @@ from diagrams import Cluster, Diagram
 from diagrams.aws.network import ELB
 from diagrams.onprem.database import Postgresql
 from diagrams.onprem.queue import Rabbitmq
+from diagrams.programming.framework import Flask
 from diagrams.programming.language import Python
 
 with Diagram("Taxi Pipeline", filename="architecture/architecture", show=False):
@@ -11,7 +12,7 @@ with Diagram("Taxi Pipeline", filename="architecture/architecture", show=False):
         upl = Python("Uploader")
     mq = Rabbitmq("RabbitMQ")
     db = Postgresql("Postgres")
-    api = Python("Presenter")
+    api = Flask("Presenter")
     ui = ELB("Streamlit")
 
     prod >> mq

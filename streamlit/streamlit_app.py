@@ -10,13 +10,15 @@ st.title("🚕  NYC Taxi Explorer")
 
 dt_from = st.date_input("From", value=pd.Timestamp("2017-12-01"))
 dt_to = st.date_input("To", value=pd.Timestamp("2020-01-31"))
-borough = st.selectbox(
-    "Borough", ["", "Manhattan", "Brooklyn", "Queens", "Bronx", "EWR"]
-)
+# borough = st.selectbox(
+#     "Borough", ["", "Manhattan", "Brooklyn", "Queens", "Bronx", "EWR"]
+# )
+borough_data = requests.get(f"{API}/boroughs").json()
+BOROUGHS = [""] + [item["borough"] for item in borough_data]
 
 params = {"from": dt_from, "to": dt_to}
-if borough:
-    params["borough"] = borough
+if BOROUGHS:
+    params["borough"] = BOROUGHS
 
 data = requests.get(f"{API}/stats/daily_fare", params=params).json()
 df = pd.DataFrame(data)
